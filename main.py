@@ -18,8 +18,9 @@ Required environment variables (set in .env locally or GitHub Secrets):
 import os
 import json
 import re
+import base64
+import requests
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -38,22 +39,30 @@ PLAYLISTS = {
 # ── Spotify auth using refresh token ─────────────────────────────────────────
 
 def get_spotify_client() -> tuple[spotipy.Spotify, str]:
-    """Return an authenticated Spotify client and raw access token."""
+    """Return an authenticated Spotify client and raw access token.
+
+    Uses a direct HTTP call to refresh the token — no SpotifyOAuth interactive
+    flow, so it works safely in CI / GitHub Actions without hanging.
+    """
     client_id = os.environ["SPOTIFY_CLIENT_ID"]
     client_secret = os.environ["SPOTIFY_CLIENT_SECRET"]
-    redirect_uri = os.environ["SPOTIFY_REDIRECT_URI"]
     refresh_token = os.environ["SPOTIFY_REFRESH_TOKEN"]
 
-    auth_manager = SpotifyOAuth(
-        client_id=client_id,
-        client_secret=client_secret,
-        redirect_uri=redirect_uri,
-        scope="user-read-recently-played user-top-read user-library-read playlist-read-private playlist-modify-public playlist-modify-private",
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    resp = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        timeout=15,
     )
-
-    # Inject the stored refresh token so we never need a browser
-    token_info = auth_manager.refresh_access_token(refresh_token)
-    access_token = token_info["access_token"]
+    resp.raise_for_status()
+    access_token = resp.json()["access_token"]
     return spotipy.Spotify(auth=access_token), access_token
 
 
