@@ -18,6 +18,7 @@ Required environment variables (set in .env locally or GitHub Secrets):
 import os
 import json
 import re
+import random
 import base64
 import requests
 import spotipy
@@ -77,45 +78,62 @@ def _track_to_dict(track: dict) -> dict:
     }
 
 
-def fetch_tracks(sp: spotipy.Spotify) -> list[dict]:
+def fetch_tracks(sp: spotipy.Spotify) -> tuple[list[dict], dict[str, int]]:
     """Merge recently played + liked songs + top tracks, deduplicated.
 
-    Sources:
-      - Recently played       : up to 50 plays  → fresh mood signal
-      - Liked songs           : up to 50 tracks → your curated favourites
-      - Top tracks short term : up to 50 tracks → last ~4 weeks favourites
-      - Top tracks medium term: up to 50 tracks → last ~6 months favourites
+    Returns:
+      tracks          : deduplicated list of track dicts
+      source_priority : {track_id: priority} — lower = stronger mood signal
+                        1=recently played, 2=liked, 3=top short, 4=top medium
     """
     seen: set[str] = set()
     tracks: list[dict] = []
+    source_priority: dict[str, int] = {}
 
-    def add(track: dict) -> None:
+    def add(track: dict, priority: int) -> None:
         tid = track.get("id")
         if tid and tid not in seen:
             seen.add(tid)
             tracks.append(_track_to_dict(track))
+            source_priority[tid] = priority
 
-    # 1. Recently played
+    # 1. Recently played — strongest signal (priority 1)
     recent = sp.current_user_recently_played(limit=50)
     for item in recent["items"]:
-        add(item["track"])
+        add(item["track"], 1)
 
-    # 2. Liked songs
+    # 2. Liked songs — explicit saves (priority 2)
     liked = sp.current_user_saved_tracks(limit=50)
     for item in liked["items"]:
-        add(item["track"])
+        add(item["track"], 2)
 
-    # 3. Top tracks — short term (~4 weeks)
+    # 3. Top tracks — short term (~4 weeks) (priority 3)
     top_short = sp.current_user_top_tracks(limit=50, time_range="short_term")
     for item in top_short["items"]:
-        add(item)
+        add(item, 3)
 
-    # 4. Top tracks — medium term (~6 months)
+    # 4. Top tracks — medium term (~6 months) (priority 4)
     top_medium = sp.current_user_top_tracks(limit=50, time_range="medium_term")
     for item in top_medium["items"]:
-        add(item)
+        add(item, 4)
 
-    return tracks
+    return tracks, source_priority
+
+
+def pick_seeds(
+    tracks_by_id: dict[str, dict],
+    classified_ids: list[str],
+    source_priority: dict[str, int],
+    n: int = 10,
+) -> list[dict]:
+    """Pick up to n seed tracks from classified_ids for a mood.
+
+    Sorts by source priority so recently played come first (strongest signal),
+    then liked songs, then top tracks.
+    """
+    candidates = [tid for tid in classified_ids if tid in tracks_by_id]
+    candidates.sort(key=lambda tid: source_priority.get(tid, 99))
+    return [tracks_by_id[tid] for tid in candidates[:n]]
 
 
 # ── Classify songs with Gemini ────────────────────────────────────────────────
@@ -175,7 +193,69 @@ def classify_tracks(tracks: list[dict]) -> dict[str, list[str]]:
     return classification
 
 
-# ── Playlist helpers ──────────────────────────────────────────────────────────
+# ── Discovery: find similar artists via Gemini, search tracks on Spotify ────────
+
+DISCOVERY_PROMPT = """You are a music expert.
+Given a list of seed songs that fit a specific mood, suggest 6 artists the listener would enjoy but has NOT heard yet.
+The artists must closely match the mood and style of the seed songs.
+Respond ONLY with a valid JSON array of artist name strings, no extra text:
+["Artist 1", "Artist 2", "Artist 3", "Artist 4", "Artist 5", "Artist 6"]"""
+
+
+def discover_similar_tracks(
+    sp: spotipy.Spotify,
+    seed_tracks: list[dict],
+    known_ids: set[str],
+    mood_name: str,
+    target_count: int = 30,
+) -> list[str]:
+    """Ask Gemini for similar artists, search Spotify, return fresh track IDs."""
+    api_key = os.environ["GEMINI_API_KEY"]
+    genai.configure(api_key=api_key)
+
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        system_instruction=DISCOVERY_PROMPT,
+    )
+
+    payload = json.dumps(seed_tracks, ensure_ascii=False, indent=2)
+    response = model.generate_content(
+        f"Mood: {mood_name}\n\nSeed songs:\n{payload}"
+    )
+
+    raw = response.text.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    suggested_artists: list[str] = json.loads(raw)
+    print(f"    Similar artists: {', '.join(suggested_artists)}")
+
+    discovered: list[str] = []
+    seen_discovered: set[str] = set()
+
+    for artist in suggested_artists:
+        if len(discovered) >= target_count:
+            break
+        results = sp.search(q=f"artist:{artist}", type="track", limit=10)
+        for item in results["tracks"]["items"]:
+            tid = item.get("id")
+            if tid and tid not in known_ids and tid not in seen_discovered:
+                seen_discovered.add(tid)
+                discovered.append(tid)
+
+    return discovered[:target_count]
+
+
+# ── Blend helpers ────────────────────────────────────────────────────
+
+
+def blend_playlist(existing_ids: list[str], discovered_ids: list[str], total: int = 50) -> list[str]:
+    """Return a shuffled blend: 40% familiar tracks + 60% fresh discoveries."""
+    want_existing = round(total * 0.4)
+    want_discovered = total - want_existing
+    blended = existing_ids[:want_existing] + discovered_ids[:want_discovered]
+    random.shuffle(blended)
+    return blended
+
 
 def get_or_create_playlist(
     sp: spotipy.Spotify, user_id: str, name: str
@@ -242,32 +322,53 @@ def replace_playlist_tracks(
 def main() -> None:
     print("=== Spotify AI Playlist ===\n")
 
-    print("Step 1/4  Connecting to Spotify...")
-    sp, access_token = get_spotify_client()
+    print("Step 1/5  Connecting to Spotify...")
+    sp, _ = get_spotify_client()
     user = sp.current_user()
     user_id = user["id"]
     print(f"  Logged in as: {user['display_name']} ({user_id})\n")
 
-    print("Step 2/4  Fetching tracks (recently played + top tracks)...")
-    tracks = fetch_tracks(sp)
+    print("Step 2/5  Fetching tracks (recently played + liked + top tracks)...")
+    tracks, source_priority = fetch_tracks(sp)
     print(f"  Fetched {len(tracks)} unique tracks across all sources\n")
 
     if not tracks:
         print("No tracks found. Exiting.")
         return
 
-    print("Step 3/4  Classifying tracks with Gemini 2.5 Flash...")
+    tracks_by_id = {t["id"]: t for t in tracks}
+    known_ids = set(tracks_by_id.keys())
+
+    print("Step 3/5  Classifying tracks with Gemini 2.5 Flash...")
     classification = classify_tracks(tracks)
     for mood, ids in classification.items():
         print(f"  {mood}: {len(ids)} tracks")
     print()
 
-    print("Step 4/4  Updating Spotify playlists...")
+    print("Step 4/5  Discovering similar tracks via Gemini + Spotify Search...")
+    discovered: dict[str, list[str]] = {}
+    for mood_name, classified_ids in classification.items():
+        print(f"  [{mood_name}]")
+        seeds = pick_seeds(tracks_by_id, classified_ids, source_priority, n=10)
+        if not seeds:
+            print("    No seeds available, skipping discovery.")
+            discovered[mood_name] = []
+            continue
+        new_tracks = discover_similar_tracks(sp, seeds, known_ids, mood_name, target_count=30)
+        discovered[mood_name] = new_tracks
+        print(f"    Found {len(new_tracks)} fresh tracks")
+    print()
+
+    print("Step 5/5  Blending and updating Spotify playlists...")
     for mood_name in PLAYLISTS:
-        track_ids = classification.get(mood_name, [])
+        existing_ids = classification.get(mood_name, [])
+        new_ids = discovered.get(mood_name, [])
+        final_ids = blend_playlist(existing_ids, new_ids, total=50)
         playlist_id = get_or_create_playlist(sp, user_id, mood_name)
-        replace_playlist_tracks(sp, playlist_id, track_ids)
-        print(f"  Updated '{mood_name}' with {len(track_ids)} tracks")
+        replace_playlist_tracks(sp, playlist_id, final_ids)
+        existing_count = min(len(existing_ids), round(50 * 0.4))
+        new_count = len(final_ids) - existing_count
+        print(f"  '{mood_name}': {existing_count} familiar + {new_count} fresh = {len(final_ids)} tracks")
 
     print("\nDone! Your playlists have been refreshed.")
 
