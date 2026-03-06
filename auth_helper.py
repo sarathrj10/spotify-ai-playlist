@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SCOPE = "user-read-recently-played user-top-read user-library-read playlist-read-private playlist-modify-public playlist-modify-private"
+SCOPE = "user-read-recently-played user-top-read user-library-read playlist-read-private playlist-modify-public"
 
 auth_manager = SpotifyOAuth(
         client_id=os.environ["SPOTIFY_CLIENT_ID"],
